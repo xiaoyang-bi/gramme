@@ -32,10 +32,12 @@ class EvalOdom():
         """
 
         # partial sequences in the robotcar dataset are around 3km and the regular sequences are 9km
-        if isPartial:
-            self.lengths = [500, 1000, 1500, 2000, 2500, 3000]
-        else:
-            self.lengths = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]
+        # if isPartial:
+        #     self.lengths = [500, 1000, 1500, 2000, 2500, 3000]
+        # else:
+        #     self.lengths = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]
+        self.lengths = [100, 200, 300, 400, 500, 600, 700, 800]
+        
         self.num_lengths = len(self.lengths)
         self.step_size = fps  # FPS
 

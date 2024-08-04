@@ -24,6 +24,8 @@ from inverse_warp_vo2 import MonoWarper
 from radar_eval.eval_utils import getTraj, RadarEvalOdom
 from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
+from radar_eval.eval_odometry import EvalOdom
+
 
 # Supress UserWarning from grid_sample
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -56,7 +58,7 @@ parser.add_argument('--weight-decay', '--wd', default=0,
                     type=float, metavar='W', help='weight decay')
 parser.add_argument('--print-freq', default=10, type=int,
                     metavar='N', help='print frequency')
-parser.add_argument('--ckpt-freq', default=1, type=int,
+parser.add_argument('--ckpt-freq', default=10, type=int,
                     metavar='N', help='checkpoint saving frequency in terms of epochs')
 parser.add_argument('--seed', default=0, type=int,
                     help='seed for random functions, and network initialization')
@@ -135,6 +137,9 @@ parser.add_argument('--cart-res', type=float,
                     help='Cartesian resolution of FMCW radar in meters/pixel', metavar='W', default=0.25)
 parser.add_argument('--cart-pixels', type=int,
                     help='Cartesian size in pixels (used for both height and width)', metavar='W', default=512)
+
+parser.add_argument('--results-dir', default='samples', metavar='PATH',
+                    help='directory where to save predicted trajectories and stats')
 # parser.add_argument('--num-range-bins', type=int, help='Number of ADC samples (range bins)', metavar='W', default=256)
 # parser.add_argument('--num-angle-bins', type=int, help='Number of angle bins', metavar='W', default=64)
 
@@ -319,34 +324,45 @@ def main():
         cam_preprocessed=args.with_preprocessed
     )
 
-    val_set = SequenceFolder(
-        args.data,
-        transform=val_transform,
-        seed=args.seed,
-        mode='val',
-        sequence_length=args.sequence_length,
-        skip_frames=args.skip_frames,
-        dataset=args.dataset,
-        ro_params=ro_params,
-        load_camera=args.with_vo,
-        cam_mode=args.cam_mode,
-        cam_transform=cam_valid_transform,
-        cam_preprocessed=args.with_preprocessed
-    )
+    scene_list_path = Path(args.data)/'val.txt'
+    val_scenes = [Path(args.data)/folder.strip() for folder in open(scene_list_path)
+                    if not folder.strip().startswith("#")]
+    val_sets = []
+    for scene in val_scenes:    
+        val_set = SequenceFolder(
+            args.data,
+            transform=val_transform,
+            seed=args.seed,
+            mode='val',
+            sequence_length=args.sequence_length,
+            skip_frames=args.skip_frames,
+            dataset=args.dataset,
+            ro_params=ro_params,
+            load_camera=args.with_vo,
+            cam_mode=args.cam_mode,
+            cam_transform=cam_valid_transform,
+            cam_preprocessed=args.with_preprocessed,
+            sequence=str(scene.name)
+        )
+        val_sets.append(val_set)
+        print('{} samples found in {} valid scenes'.format(
+        len(val_set), len(val_set.scenes)))
 
     print('{} samples found in {} train scenes'.format(
         len(train_set), len(train_set.scenes)))
-    print('{} samples found in {} valid scenes'.format(
-        len(val_set), len(val_set.scenes)))
     cl_fn = None
     # if args.with_vo:
     #     cl_fn = mono_collate_fn
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, collate_fn=cl_fn)
-    val_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, collate_fn=cl_fn)
+    
+    val_loaders = {}
+    for scene_i, scene in enumerate(val_scenes):    
+        val_loader = torch.utils.data.DataLoader(
+            val_sets[scene_i], batch_size=1, shuffle=False,
+            num_workers=args.workers, pin_memory=True, collate_fn=cl_fn)
+        val_loaders[str(scene.name)] = val_loader
 
     if args.train_size == 0:
         args.train_size = len(train_loader)
@@ -497,7 +513,7 @@ def main():
         # evaluate on validation set
         logger.reset_valid_bar()
         val_loss = validate(
-            args, val_loader, mask_net, radar_pose_net, disp_net, camera_pose_net, fuse_net,
+            args, val_loaders, mask_net, radar_pose_net, disp_net, camera_pose_net, fuse_net,
             epoch, logger, warper, mono_warper, val_writer)
         logger.valid_writer.write(' * Avg Loss : {:.3f}'.format(val_loss))
 
@@ -840,278 +856,301 @@ def train(
 
 @torch.no_grad()
 def validate(
-        args, val_loader, mask_net, radar_pose_net, disp_net, camera_pose_net, fuse_net,
+        args, val_loaders, mask_net, radar_pose_net, disp_net, camera_pose_net, fuse_net,
         epoch, logger, warper, mono_warper, val_writer):
-    global device
-    batch_time = AverageMeter()
-    losses = AverageMeter(i=10 if args.with_vo else 5, precision=4)
-    log_outputs = val_writer is not None
-    w1, w2, w3, w4 = args.photo_loss_weight, args.geometry_consistency_weight, args.fft_loss_weight, args.ssim_loss_weight
+    for scene in val_loaders:
+        val_loader = val_loaders[scene]
+        global device
+        batch_time = AverageMeter()
+        losses = AverageMeter(i=10 if args.with_vo else 5, precision=4)
+        log_outputs = val_writer is not None
+        w1, w2, w3, w4 = args.photo_loss_weight, args.geometry_consistency_weight, args.fft_loss_weight, args.ssim_loss_weight
 
-    # switch to eval mode
-    if args.with_masknet:
-        mask_net.eval()
-    if args.with_vo:
-        disp_net.eval()
-        camera_pose_net.eval()
-        fuse_net.eval()
-    radar_pose_net.eval()
-
-    all_poses = []
-    all_inv_poses = []
-    all_poses_mono = []
-    all_inv_poses_mono = []
-    all_poses_mono2radar = []
-    all_inv_poses_mono2radar = []
-
-    # Randomly choose n indices to log images
-    rng = np.random.default_rng()
-    log_ind = rng.integers(len(val_loader), size=1)
-
-    end = time.time()
-    logger.valid_bar.update(0)
-    tgt_timestamps = []
-    for i, input in enumerate(val_loader):
-        tgt_img = input[0]
-        ref_imgs = input[1]
-        tgt_img = torch.nan_to_num(tgt_img.to(device))
-        ref_imgs = [torch.nan_to_num(img.to(device)) for img in ref_imgs]
-        tgt_timestamps.append(input[-1])
-        # intrinsics = intrinsics.to(device)
-        # intrinsics_inv = intrinsics_inv.to(device)
-
-        # compute output
-        tgt_mask, ref_masks = None, [
-            None for i in range(args.sequence_length-1)]
+        # switch to eval mode
         if args.with_masknet:
-            tgt_mask, ref_masks = compute_mask(mask_net, tgt_img, ref_imgs)
-        ro_poses, ro_poses_inv = compute_pose_with_inv(
-            radar_pose_net, tgt_img, ref_imgs)
-        all_poses.append(ro_poses)
-        all_inv_poses.append(ro_poses_inv)
-
-        (rec_loss, geometry_consistency_loss, fft_loss, ssim_loss,
-         projected_imgs, projected_masks) = warper.compute_db_loss(
-            tgt_img, ref_imgs, tgt_mask, ref_masks, ro_poses, ro_poses_inv)
-
-        rec_loss = w1*rec_loss
-        geometry_consistency_loss = w2*geometry_consistency_loss
-        fft_loss = w3*fft_loss
-        ssim_loss = w4*ssim_loss
-        radar_loss = rec_loss + geometry_consistency_loss + fft_loss + ssim_loss
-
-        vo_loss = 0
+            mask_net.eval()
         if args.with_vo:
-            # num_scales = 4, num_match=3
-            vo_tgt_img = input[2]  # [B,3,H,W]
-            vo_ref_imgs = input[3]  # [2,3,B,3,H,W] First two dims are list
-            intrinsics = input[4]
-            vo_tgt_img = torch.nan_to_num(vo_tgt_img.to(device))
-            vo_ref_imgs = [torch.nan_to_num(
-                ref_img.to(device)) for ref_img in vo_ref_imgs]
-            intrinsics = [i.to(device)for i in intrinsics]
-            # tgt_depth: [4,B,1,H,W]
-            # ref_depths: [2,3,4,B,1,H,W]
-            # vo_poses: [2,3,B,6]
-            # vo_poses_inv: [2,3,B,6]
+            disp_net.eval()
+            camera_pose_net.eval()
+            fuse_net.eval()
+        radar_pose_net.eval()
 
-            tgt_depth, ref_depths = compute_depth(
-                disp_net, vo_tgt_img, vo_ref_imgs)
-            vo_poses, vo_poses_inv = compute_pose_with_inv(
-                camera_pose_net, vo_tgt_img, vo_ref_imgs)
+        all_poses = []
+        all_inv_poses = []
+        all_poses_mono = []
+        all_inv_poses_mono = []
+        all_poses_mono2radar = []
+        all_inv_poses_mono2radar = []
 
-            # Recover the absolute pose scale
-            vo_poses_mono = torch.cat((
-                depth_scale * vo_poses[..., :3], vo_poses[..., 3:]), -1)
-            vo_poses_inv_mono = torch.cat((
-                depth_scale * vo_poses_inv[..., :3], vo_poses_inv[..., 3:]), -1)
+        # Randomly choose n indices to log images
+        rng = np.random.default_rng()
+        log_ind = rng.integers(len(val_loader), size=1)
 
-            # Collect camera poses in radar format ([rx,ry,rz,tx,ty,tz])
-            all_poses_mono.append(
-                torch.cat((vo_poses_mono[..., 3:], vo_poses_mono[..., :3]), -1))
-            all_inv_poses_mono.append(
-                torch.cat((vo_poses_inv_mono[..., 3:], vo_poses_inv_mono[..., :3]), -1))
-
-            # t = (ro_poses[..., [3, 4]] + vo_poses[..., [1, 2]])/2
-            # vo_poses[..., [1, 2]] = t
-            # t = (ro_poses_inv[..., [3, 4]] +
-            #      vo_poses_inv[..., [1, 2]])/2
-            # vo_poses_inv[..., [1, 2]] = t
-
-            # Pass all the corresponding monocular frames, pose and depth variables to the reconstruction module.
-            # It calculates the triple-wise losses of the sequence.
-            (vo_photo_loss, vo_smooth_loss, vo_geometry_loss, vo_ssim_loss,
-             mono_ref_imgs_warped, mono_valid_mask) = mono_warper.compute_photo_and_geometry_loss(
-                vo_tgt_img, vo_ref_imgs, intrinsics, tgt_depth, ref_depths, vo_poses, vo_poses_inv)
-
-            # vo_loss = w1*loss_1 + w2*loss_2 + w3*loss_3
-            vo_photo_loss = 1.0*vo_photo_loss
-            vo_smooth_loss = 0.1*vo_smooth_loss
-            vo_geometry_loss = 0.5*vo_geometry_loss
-            vo_loss = vo_photo_loss + vo_smooth_loss + vo_geometry_loss + vo_ssim_loss
-
-            vo2radar_poses = fuse_net(vo_poses_mono)
-            vo2radar_poses_inv = fuse_net(vo_poses_inv_mono)
-
-            # Change VO pose order to RO
-            # all_poses_mono.append(
-            #     torch.cat((vo_poses[..., 3:], vo_poses[..., :3]), -1))
-            # all_inv_poses_mono.append(
-            #     torch.cat((vo_poses_inv[..., 3:], vo_poses_inv[..., :3]), -1))
-            all_poses_mono2radar.append(vo2radar_poses)
-            all_inv_poses_mono2radar.append(vo2radar_poses_inv)
-
-        loss = radar_loss + vo_loss
-
-        if log_outputs and i in log_ind:
-            val_writer.add_image(
-                'val/radar/tgt_input', utils.tensor2array(tgt_img[0], max_value=1.0, colormap='bone'), epoch)
-            val_writer.add_image(
-                'val/radar/ref_input', utils.tensor2array(ref_imgs[0][0], max_value=1.0, colormap='bone'), epoch)
-            val_writer.add_image(
-                'val/radar/warped_ref', utils.tensor2array(projected_imgs[0][0], max_value=1.0, colormap='bone'), epoch)
-            if args.with_masknet:
-                val_writer.add_image(
-                    'val/radar/warped_mask', utils.tensor2array(projected_masks[0][0], max_value=1.0, colormap='bone'), epoch)
-                val_writer.add_image(
-                    'val/radar/tgt_mask', utils.tensor2array(tgt_mask[0], max_value=1.0, colormap='bone'), epoch)
-            if args.with_vo:
-                val_writer.add_image(
-                    'val/mono/tgt_input', utils.tensor2array(vo_tgt_img[0]), epoch)
-                val_writer.add_image(
-                    'val/mono/ref_input', utils.tensor2array(vo_ref_imgs[0][0]), epoch)
-                val_writer.add_image(
-                    'val/mono/warped_ref', utils.tensor2array(mono_ref_imgs_warped[0][0]), epoch)
-                val_writer.add_image(
-                    'val/mono/tgt_disp', utils.tensor2array(1/tgt_depth[0][0], colormap='viridis'), epoch)
-                val_writer.add_image(
-                    'val/mono/tgt_depth', utils.tensor2array(tgt_depth[0][0], colormap='inferno'), epoch)
-                val_writer.add_image(
-                    'val/mono/warped_mask', utils.tensor2array(mono_valid_mask[0], max_value=1.0, colormap='bone'), epoch)
-
-        losses_it = [loss.item(), rec_loss.item(), geometry_consistency_loss.item(
-        ), fft_loss.item(), ssim_loss.item()]
-        if args.with_vo:
-            losses_it.extend(
-                [vo_loss.item(), vo_photo_loss.item(), vo_smooth_loss.item(), vo_geometry_loss.item(), vo_ssim_loss.item()])
-        losses.update(losses_it, args.batch_size)
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
         end = time.time()
-        logger.valid_bar.update(i+1)
-        if i % args.print_freq == 0:
-            logger.valid_writer.write(
-                'valid: Time {} Loss {}'.format(batch_time, losses))
-        if i >= args.val_size - 1:
-            break
+        logger.valid_bar.update(0)
+        tgt_timestamps = []
+        for i, input in enumerate(val_loader):
+            tgt_img = input[0]
+            ref_imgs = input[1]
+            tgt_img = torch.nan_to_num(tgt_img.to(device))
+            ref_imgs = [torch.nan_to_num(img.to(device)) for img in ref_imgs]
+            tgt_timestamps.append(input[-1])
+            # intrinsics = intrinsics.to(device)
+            # intrinsics_inv = intrinsics_inv.to(device)
 
-    if log_outputs:
-        # Log predicted relative poses in histograms
-        all_poses_t = torch.cat(all_poses, 1)  # [seq_length, N, 6]
-        tags = ['rot_pred-x', 'rot_pred-y', 'rot_pred-z',
-                'trans_pred-x', 'trans_pred-y', 'trans_pred-z']
+            # compute output
+            tgt_mask, ref_masks = None, [
+                None for i in range(args.sequence_length-1)]
+            if args.with_masknet:
+                tgt_mask, ref_masks = compute_mask(mask_net, tgt_img, ref_imgs)
+            ro_poses, ro_poses_inv = compute_pose_with_inv(
+                radar_pose_net, tgt_img, ref_imgs)
+            all_poses.append(ro_poses)
+            all_inv_poses.append(ro_poses_inv)
 
-        for i, tag in enumerate(tags):
-            val_writer.add_histogram(
-                'val/radar/'+tag, all_poses_t[..., i], epoch)
+            (rec_loss, geometry_consistency_loss, fft_loss, ssim_loss,
+            projected_imgs, projected_masks) = warper.compute_db_loss(
+                tgt_img, ref_imgs, tgt_mask, ref_masks, ro_poses, ro_poses_inv)
 
-        if args.with_vo:
-            all_poses_mono_t = torch.cat(
-                all_poses_mono, 1)
-            for i, tag in enumerate(tags):
-                val_writer.add_histogram(
-                    'val/mono/'+tag, all_poses_mono_t[..., i], epoch)
-            all_poses_mono2radar_t = torch.cat(
-                all_poses_mono2radar, 1)
-            for i, tag in enumerate(tags):
-                val_writer.add_histogram(
-                    'val/mono_fused/'+tag, all_poses_mono2radar_t[..., i], epoch)
+            rec_loss = w1*rec_loss
+            geometry_consistency_loss = w2*geometry_consistency_loss
+            fft_loss = w3*fft_loss
+            ssim_loss = w4*ssim_loss
+            radar_loss = rec_loss + geometry_consistency_loss + fft_loss + ssim_loss
 
-    logger.valid_bar.update(args.val_size)
+            vo_loss = 0
+            if args.with_vo:
+                # num_scales = 4, num_match=3
+                vo_tgt_img = input[2]  # [B,3,H,W]
+                vo_ref_imgs = input[3]  # [2,3,B,3,H,W] First two dims are list
+                intrinsics = input[4]
+                vo_tgt_img = torch.nan_to_num(vo_tgt_img.to(device))
+                vo_ref_imgs = [torch.nan_to_num(
+                    ref_img.to(device)) for ref_img in vo_ref_imgs]
+                intrinsics = [i.to(device)for i in intrinsics]
+                # tgt_depth: [4,B,1,H,W]
+                # ref_depths: [2,3,4,B,1,H,W]
+                # vo_poses: [2,3,B,6]
+                # vo_poses_inv: [2,3,B,6]
 
-    # Log errors
-    errors = losses.avg
-    error_names = ['total_loss', 'rec_loss',
-                   'geometry_consistency_loss', 'fft_loss', 'ssim_loss']
-    if args.with_vo:
-        error_names.extend(
-            ['vo_loss', 'vo_photo_loss', 'vo_smooth_loss', 'vo_geometry_loss', 'vo_ssim_loss'])
-    error_string = ', '.join('{} : {:.3f}'.format(name, error)
-                             for name, error in zip(error_names, errors))
-    logger.valid_writer.write(' * Avg {}'.format(error_string))
+                tgt_depth, ref_depths = compute_depth(
+                    disp_net, vo_tgt_img, vo_ref_imgs)
+                vo_poses, vo_poses_inv = compute_pose_with_inv(
+                    camera_pose_net, vo_tgt_img, vo_ref_imgs)
 
-    if log_outputs:
-        for error, name in zip(errors, error_names):
-            val_writer.add_scalar('val/'+name, error, epoch)
+                # Recover the absolute pose scale
+                vo_poses_mono = torch.cat((
+                    depth_scale * vo_poses[..., :3], vo_poses[..., 3:]), -1)
+                vo_poses_inv_mono = torch.cat((
+                    depth_scale * vo_poses_inv[..., :3], vo_poses_inv[..., 3:]), -1)
 
-    if args.gt_file is not None:
-        # TODO: RADIATE GPS ground-truth causes alignment problems.
-        # Don't use GT for RADIATE yet!
-        ro_eval = RadarEvalOdom(args.gt_file, args.dataset, tgt_timestamps)
+                # Collect camera poses in radar format ([rx,ry,rz,tx,ty,tz])
+                all_poses_mono.append(
+                    torch.cat((vo_poses_mono[..., 3:], vo_poses_mono[..., :3]), -1))
+                all_inv_poses_mono.append(
+                    torch.cat((vo_poses_inv_mono[..., 3:], vo_poses_inv_mono[..., :3]), -1))
 
-        ate_f, f_pred_xyz, f_pred = ro_eval.eval_ref_poses(
-            all_poses, all_inv_poses, args.skip_frames)
-        print(ate_f)
+                # t = (ro_poses[..., [3, 4]] + vo_poses[..., [1, 2]])/2
+                # vo_poses[..., [1, 2]] = t
+                # t = (ro_poses_inv[..., [3, 4]] +
+                #      vo_poses_inv[..., [1, 2]])/2
+                # vo_poses_inv[..., [1, 2]] = t
 
-        if args.with_vo:
-            ate_f_mono, f_pred_xyz_mono, f_pred_mono = ro_eval.eval_ref_poses(
-                all_poses_mono, all_inv_poses_mono, args.skip_frames, estimate_scale=True)
-            ate_f_mono2radar, f_pred_xyz_mono2radar, f_pred_mono2radar = ro_eval.eval_ref_poses(
-                all_poses_mono2radar, all_inv_poses_mono2radar, args.skip_frames)
+                # Pass all the corresponding monocular frames, pose and depth variables to the reconstruction module.
+                # It calculates the triple-wise losses of the sequence.
+                (vo_photo_loss, vo_smooth_loss, vo_geometry_loss, vo_ssim_loss,
+                mono_ref_imgs_warped, mono_valid_mask) = mono_warper.compute_photo_and_geometry_loss(
+                    vo_tgt_img, vo_ref_imgs, intrinsics, tgt_depth, ref_depths, vo_poses, vo_poses_inv)
+
+                # vo_loss = w1*loss_1 + w2*loss_2 + w3*loss_3
+                vo_photo_loss = 1.0*vo_photo_loss
+                vo_smooth_loss = 0.1*vo_smooth_loss
+                vo_geometry_loss = 0.5*vo_geometry_loss
+                vo_loss = vo_photo_loss + vo_smooth_loss + vo_geometry_loss + vo_ssim_loss
+
+                vo2radar_poses = fuse_net(vo_poses_mono)
+                vo2radar_poses_inv = fuse_net(vo_poses_inv_mono)
+
+                # Change VO pose order to RO
+                # all_poses_mono.append(
+                #     torch.cat((vo_poses[..., 3:], vo_poses[..., :3]), -1))
+                # all_inv_poses_mono.append(
+                #     torch.cat((vo_poses_inv[..., 3:], vo_poses_inv[..., :3]), -1))
+                all_poses_mono2radar.append(vo2radar_poses)
+                all_inv_poses_mono2radar.append(vo2radar_poses_inv)
+
+            loss = radar_loss + vo_loss
+
+            if log_outputs and i in log_ind:
+                val_writer.add_image(
+                    'val/radar/tgt_input', utils.tensor2array(tgt_img[0], max_value=1.0, colormap='bone'), epoch)
+                val_writer.add_image(
+                    'val/radar/ref_input', utils.tensor2array(ref_imgs[0][0], max_value=1.0, colormap='bone'), epoch)
+                val_writer.add_image(
+                    'val/radar/warped_ref', utils.tensor2array(projected_imgs[0][0], max_value=1.0, colormap='bone'), epoch)
+                if args.with_masknet:
+                    val_writer.add_image(
+                        'val/radar/warped_mask', utils.tensor2array(projected_masks[0][0], max_value=1.0, colormap='bone'), epoch)
+                    val_writer.add_image(
+                        'val/radar/tgt_mask', utils.tensor2array(tgt_mask[0], max_value=1.0, colormap='bone'), epoch)
+                if args.with_vo:
+                    val_writer.add_image(
+                        'val/mono/tgt_input', utils.tensor2array(vo_tgt_img[0]), epoch)
+                    val_writer.add_image(
+                        'val/mono/ref_input', utils.tensor2array(vo_ref_imgs[0][0]), epoch)
+                    val_writer.add_image(
+                        'val/mono/warped_ref', utils.tensor2array(mono_ref_imgs_warped[0][0]), epoch)
+                    val_writer.add_image(
+                        'val/mono/tgt_disp', utils.tensor2array(1/tgt_depth[0][0], colormap='viridis'), epoch)
+                    val_writer.add_image(
+                        'val/mono/tgt_depth', utils.tensor2array(tgt_depth[0][0], colormap='inferno'), epoch)
+                    val_writer.add_image(
+                        'val/mono/warped_mask', utils.tensor2array(mono_valid_mask[0], max_value=1.0, colormap='bone'), epoch)
+
+            losses_it = [loss.item(), rec_loss.item(), geometry_consistency_loss.item(
+            ), fft_loss.item(), ssim_loss.item()]
+            if args.with_vo:
+                losses_it.extend(
+                    [vo_loss.item(), vo_photo_loss.item(), vo_smooth_loss.item(), vo_geometry_loss.item(), vo_ssim_loss.item()])
+            losses.update(losses_it, args.batch_size)
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+            logger.valid_bar.update(i+1)
+            if i % args.print_freq == 0:
+                logger.valid_writer.write(
+                    'valid: Time {} Loss {}'.format(batch_time, losses))
+            if i >= args.val_size - 1:
+                break
 
         if log_outputs:
-            # Plot and log aligned trajectory
-            fig = utils.traj2Fig_withgt(
-                f_pred_xyz.squeeze(), ro_eval.gt[:, :3, 3].squeeze())
-            # fig2= utils.traj2Fig(f_pred[:,:3,3])
-            val_writer.add_figure(
-                'val/fig/radar/traj_aligned_pred', fig, epoch)
-            # output_writers[0].add_figure('val/fig/traj_pred_full_aligned', fig2, epoch)
+            # Log predicted relative poses in histograms
+            all_poses_t = torch.cat(all_poses, 1)  # [seq_length, N, 6]
+            tags = ['rot_pred-x', 'rot_pred-y', 'rot_pred-z',
+                    'trans_pred-x', 'trans_pred-y', 'trans_pred-z']
+            for i, tag in enumerate(tags):
+                tags[i] = tags[i] + scene
+                
+            for i, tag in enumerate(tags):
+                val_writer.add_histogram(
+                    'val/radar/'+tag, all_poses_t[..., i], epoch)
 
             if args.with_vo:
-                # Plot and log aligned trajectory
-                fig_mono = utils.traj2Fig_withgt(
-                    f_pred_xyz_mono.squeeze(), ro_eval.gt[:, :3, 3].squeeze(), axes=[2, 0])
-                val_writer.add_figure(
-                    'val/fig/mono/traj_aligned_pred', fig_mono, epoch)
-                # Plot and log aligned trajectory
-                fig_mono2radar = utils.traj2Fig_withgt(
-                    f_pred_xyz_mono2radar.squeeze(), ro_eval.gt[:, :3, 3].squeeze())
-                val_writer.add_figure(
-                    'val/fig/mono2radar/traj_aligned_pred', fig_mono2radar, epoch)
+                all_poses_mono_t = torch.cat(
+                    all_poses_mono, 1)
+                for i, tag in enumerate(tags):
+                    val_writer.add_histogram(
+                        'val/mono/'+tag, all_poses_mono_t[..., i], epoch)
+                all_poses_mono2radar_t = torch.cat(
+                    all_poses_mono2radar, 1)
+                for i, tag in enumerate(tags):
+                    val_writer.add_histogram(
+                        'val/mono_fused/'+tag, all_poses_mono2radar_t[..., i], epoch)
 
-    else:
-        b_pred_xyz, f_pred_xyz = getTraj(
-            all_poses, all_inv_poses, args.skip_frames)
+        logger.valid_bar.update(args.val_size)
+
+        # Log errors
+        errors = losses.avg
+        error_names = ['total_loss', 'rec_loss',
+                    'geometry_consistency_loss', 'fft_loss', 'ssim_loss']
+                   
+        if args.with_vo:
+            error_names.extend(
+                ['vo_loss', 'vo_photo_loss', 'vo_smooth_loss', 'vo_geometry_loss', 'vo_ssim_loss'])
+            
+        for i in range(len(error_names)):
+            error_names[i] += scene
+        error_string = ', '.join('{} : {:.3f}'.format(name, error)
+                                for name, error in zip(error_names, errors))
+        logger.valid_writer.write(' * Avg {}'.format(error_string))
 
         if log_outputs:
-            # Plot and log predicted trajectory
-            b_fig = utils.traj2Fig(b_pred_xyz)
-            f_fig = utils.traj2Fig(f_pred_xyz)
-            val_writer.add_figure('val/fig/radar/b_traj_pred', b_fig, epoch)
-            val_writer.add_figure('val/fig/radar/f_traj_pred', f_fig, epoch)
+            for error, name in zip(errors, error_names):
+                val_writer.add_scalar('val/'+name, error, epoch)
 
-        if args.with_vo:
-            b_pred_xyz_mono, f_pred_xyz_mono = getTraj(
-                all_poses_mono, all_inv_poses_mono, args.skip_frames)
+        if args.gt_file is not None:
+            # TODO: RADIATE GPS ground-truth causes alignment problems.
+            # Don't use GT for RADIATE yet!
+            ro_eval = RadarEvalOdom(args.gt_file, args.dataset, tgt_timestamps)
+
+            ate_f, f_pred_xyz, f_pred = ro_eval.eval_ref_poses(
+                all_poses, all_inv_poses, args.skip_frames)
+            print(ate_f)
+            
+            results_dir = Path(args.results_dir)/scene
+            results_dir.mkdir(parents=True, exist_ok=True)
+            odom_eval = EvalOdom(isPartial=False, fps=4)
+            odom_eval.eval(f_pred.cpu().numpy(),
+                        ro_eval.gt.cpu().numpy(), results_dir, plt_prefix='radar')
+
+            if args.with_vo:
+                ate_f_mono, f_pred_xyz_mono, f_pred_mono = ro_eval.eval_ref_poses(
+                    all_poses_mono, all_inv_poses_mono, args.skip_frames, estimate_scale=True)
+                ate_f_mono2radar, f_pred_xyz_mono2radar, f_pred_mono2radar = ro_eval.eval_ref_poses(
+                    all_poses_mono2radar, all_inv_poses_mono2radar, args.skip_frames)
+
+                # mono2radar metrics
+                
+                odom_eval = EvalOdom(isPartial=False, fps=4)
+                odom_eval.eval(f_pred_mono2radar.cpu().numpy(),
+                            ro_eval.gt.cpu().numpy(), results_dir, plt_prefix='mono_radar')
+                
+                odom_eval = EvalOdom(isPartial=False, fps=4)
+                odom_eval.eval(f_pred_mono.cpu().numpy(),
+                            ro_eval.gt.cpu().numpy(), results_dir, plt_prefix='mono')
+            if log_outputs:
+                # Plot and log aligned trajectory
+                fig = utils.traj2Fig_withgt(
+                    f_pred_xyz.squeeze(), ro_eval.gt[:, :3, 3].squeeze())
+                # fig2= utils.traj2Fig(f_pred[:,:3,3])
+                val_writer.add_figure(
+                    'val/fig/radar/traj_aligned_pred'+ '_' +scene, fig, epoch)
+                # output_writers[0].add_figure('val/fig/traj_pred_full_aligned', fig2, epoch)
+
+                if args.with_vo:
+                    # Plot and log aligned trajectory
+                    fig_mono = utils.traj2Fig_withgt(
+                        f_pred_xyz_mono.squeeze(), ro_eval.gt[:, :3, 3].squeeze(), axes=[0, 1])
+                    val_writer.add_figure(
+                        'val/fig/mono/traj_aligned_pred'+ '_' +scene, fig_mono, epoch)
+                    # Plot and log aligned trajectory
+                    fig_mono2radar = utils.traj2Fig_withgt(
+                        f_pred_xyz_mono2radar.squeeze(), ro_eval.gt[:, :3, 3].squeeze())
+                    val_writer.add_figure(
+                        'val/fig/mono2radar/traj_aligned_pred'+ '_' +scene, fig_mono2radar, epoch)
+
+        else:
+            b_pred_xyz, f_pred_xyz = getTraj(
+                all_poses, all_inv_poses, args.skip_frames)
+
             if log_outputs:
                 # Plot and log predicted trajectory
-                b_fig = utils.traj2Fig(b_pred_xyz_mono, axes=[2, 0])
-                f_fig = utils.traj2Fig(f_pred_xyz_mono, axes=[2, 0])
-                val_writer.add_figure('val/fig/mono/b_traj_pred', b_fig, epoch)
-                val_writer.add_figure('val/fig/mono/f_traj_pred', f_fig, epoch)
+                b_fig = utils.traj2Fig(b_pred_xyz)
+                f_fig = utils.traj2Fig(f_pred_xyz)
+                val_writer.add_figure('val/fig/radar/b_traj_pred'+ '_' +scene, b_fig, epoch)
+                val_writer.add_figure('val/fig/radar/f_traj_pred'+ '_' +scene, f_fig, epoch)
 
-            b_pred_xyz_mono2radar, f_pred_xyz_mono2radar = getTraj(
-                all_poses_mono2radar, all_inv_poses_mono2radar, args.skip_frames)
-            if log_outputs:
-                # Plot and log predicted trajectory
-                b_fig = utils.traj2Fig(b_pred_xyz_mono2radar)
-                f_fig = utils.traj2Fig(f_pred_xyz_mono2radar)
-                val_writer.add_figure(
-                    'val/fig/mono2radar/b_traj_pred', b_fig, epoch)
-                val_writer.add_figure(
-                    'val/fig/mono2radar/f_traj_pred', f_fig, epoch)
+            if args.with_vo:
+                b_pred_xyz_mono, f_pred_xyz_mono = getTraj(
+                    all_poses_mono, all_inv_poses_mono, args.skip_frames)
+                if log_outputs:
+                    # Plot and log predicted trajectory
+                    b_fig = utils.traj2Fig(b_pred_xyz_mono, axes=[0, 1])
+                    f_fig = utils.traj2Fig(f_pred_xyz_mono, axes=[0, 1])
+                    val_writer.add_figure('val/fig/mono/b_traj_pred'+ '_' +scene, b_fig, epoch)
+                    val_writer.add_figure('val/fig/mono/f_traj_pred'+ '_' +scene, f_fig, epoch)
+
+                b_pred_xyz_mono2radar, f_pred_xyz_mono2radar = getTraj(
+                    all_poses_mono2radar, all_inv_poses_mono2radar, args.skip_frames)
+                if log_outputs:
+                    # Plot and log predicted trajectory
+                    b_fig = utils.traj2Fig(b_pred_xyz_mono2radar)
+                    f_fig = utils.traj2Fig(f_pred_xyz_mono2radar)
+                    val_writer.add_figure(
+                        'val/fig/mono2radar/b_traj_pred'+ '_' +scene, b_fig, epoch)
+                    val_writer.add_figure(
+                        'val/fig/mono2radar/f_traj_pred'+ '_' +scene, f_fig, epoch)
 
     return losses.avg[0]
 

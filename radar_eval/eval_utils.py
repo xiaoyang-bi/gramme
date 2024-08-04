@@ -326,18 +326,71 @@ def load_odometry_from_folder(path, timestamp_list):
         traj_frames.append(nearest_index)
     
     # Load the corresponding twist data
-    traj = np.zeros((len(traj_frames), 6))
+    rtvecs = []
+    origin = None
     for i, frame_index in enumerate(traj_frames):
         frame = frame_index + 1  # Assuming frames are 1-indexed
         twist_path = gps_path / f"{frame:06d}.txt"
-        twist = np.genfromtxt(twist_path, delimiter=',', dtype=np.float32, max_rows=1)
-        traj[i, 3:] = twist
-    
-    gt_t = torch.Tensor(traj).to(device)  # [n,6]
-    gt_t = tgm.rtvec_to_pose(gt_t)  # [n,4,4]
+
+        position, orientation_angles = read_data_from_file(twist_path)
+        
+        if origin is None:
+            origin = position
+        
+        # Adjust position relative to the origin
+        relative_position = position - origin
+        
+        # Convert orientation angles to Rodrigues vector
+        rtvecs.append(torch.tensor([*orientation_angles, *relative_position]))
+    rtvecs = torch.stack(rtvecs, dim=0).to(device)
+    print(rtvecs.dtype)
+    gt_t = tgm.rtvec_to_pose(rtvecs)  # [n,4,4]
+    gt_t = gt_t.float()
     # gt_t = rel2abs_traj(gt_t)  # [n,4,4]
     return gt_t
 
+def read_data_from_file(filepath):
+    with open(filepath, 'r') as file:
+        lines = file.readlines()
+
+    # 解析数据
+    latitude = float(lines[0].split(',')[0])
+    longitude = float(lines[0].split(',')[1])
+    altitude = float(lines[0].split(',')[2])
+
+    orientation = [float(x) for x in lines[4].split(',')]
+    roll, pitch, yaw = quaternion_to_euler(orientation)
+
+    # position = np.array([latitude, longitude, altitude])
+    
+    er = 6378137.0  
+    scale = np.cos(latitude * np.pi / 180.0)
+    tx = scale * longitude * np.pi * er / 180.0
+    ty = scale * er * np.log(np.tan((90.0 + latitude) * np.pi / 360.0))
+    tz = altitude
+    position = np.array([tx, ty, tz])
+    
+    orientation_angles = np.array([roll, pitch, yaw])
+    return position, orientation_angles
+
+def quaternion_to_euler(quat):
+    """Convert quaternion to Euler angles."""
+    w, x, y, z = quat
+    ysqr = y * y
+    
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + ysqr)
+    roll = np.arctan2(t0, t1)
+    
+    t2 = +2.0 * (w * y - z * x)
+    t2 = np.clip(t2, -1.0, +1.0)
+    pitch = np.arcsin(t2)
+    
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (ysqr + z * z)
+    yaw = np.arctan2(t3, t4)
+    
+    return roll, pitch, yaw
 
 def getTraj(all_poses, all_inv_poses, k):
     """Convert the predicted poses to absolute trajectory. Each prediction in inputs is the relative pose for a sequence of [src_p, tgt, src_n].
