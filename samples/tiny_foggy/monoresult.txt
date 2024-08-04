@@ -1,7 +1,7 @@
 Sequence: 	 0 
 Trans. err. (%): 	 0.000 
 Rot. err. (deg/100m): 	 0.000 
-ATE (m): 	 3.628 
-RPE (m): 	 5.858 
+ATE (m): 	 2.815 
+RPE (m): 	 3.750 
 RPE (deg): 	 29.570 
 

@@ -3,5 +3,5 @@ Trans. err. (%): 	 0.000
 Rot. err. (deg/100m): 	 0.000 
 ATE (m): 	 8.091 
 RPE (m): 	 2.496 
-RPE (deg): 	 29.570 
+RPE (deg): 	 29.571 
 

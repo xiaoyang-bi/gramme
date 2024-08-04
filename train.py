@@ -1072,7 +1072,7 @@ def validate(
         if args.gt_file is not None:
             # TODO: RADIATE GPS ground-truth causes alignment problems.
             # Don't use GT for RADIATE yet!
-            ro_eval = RadarEvalOdom(args.gt_file, args.dataset, tgt_timestamps)
+            ro_eval = RadarEvalOdom(str(Path(args.data)/scene),  args.dataset, tgt_timestamps)
 
             ate_f, f_pred_xyz, f_pred = ro_eval.eval_ref_poses(
                 all_poses, all_inv_poses, args.skip_frames)
