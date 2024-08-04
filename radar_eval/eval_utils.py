@@ -19,7 +19,7 @@ class RadarEvalOdom():
         vo_eval.eval(gt_pose_txt_dir, result_pose_txt_dir)
     """
 
-    def __init__(self, f_gt, dataset):
+    def __init__(self, f_gt, dataset, timestamp_list=None):
         """Initialize with ground truth file.
 
         Args:
@@ -32,7 +32,7 @@ class RadarEvalOdom():
         elif self.dataset == 'robotcar':
             self.gt = load_odometry_from_txt(f_gt)  # [N,4,4]
         elif self.dataset == 'radiate':
-            self.gt = load_odometry_from_folder(f_gt)  # [N,4,4]
+            self.gt = load_odometry_from_folder(f_gt, timestamp_list)  # [N,4,4]
         else:
             raise RuntimeError('Unknown dataset name is provded!')
 
@@ -264,17 +264,75 @@ def load_odometry_from_txt(file_name):
     return gt_t
 
 
-def load_odometry_from_folder(path):
-    gps_path = Path(path)
-    twists = sorted(list(gps_path.glob('*.txt')))
-    traj = np.zeros((len(twists), 6))
-    for i, path in enumerate(twists):
-        # Read first GPS line: Latitude, Longitude, Altitude in degrees
-        twist = np.genfromtxt(path, delimiter=',',
-                              dtype=np.float32, max_rows=1)
-        xyz = twist
-        traj[i, 3:] = xyz
+# def load_odometry_from_folder(path, timestamp_list):
+#     # let path be "../data/radiate/tiny_foggy/ 
+#     # there is "../data/radiate/tiny_foggy/GPS_IMU_Twist/" where contains xxxx.load_xyz_from_txt
+#     # there is ""../data/radiate/tiny_foggy/GPS_IMU_Twist.txt"" where contains 
+#     #Frame: 000001 Time: 1574859835.749949000
+#     #Frame: 000002 Time: 1574859835.749949000
+#     #Frame: 000003 Time: 1574859835.799949000
+#     # the timestamp_list contains [157xxxxx, ...], for each of them find the nearest one in GPS_IMU_Twist.txt and parse the frame
+#     # and then enumerate all the correspoding frames to get traj
+#     gps_path = Path(path)
+#     twists = sorted(list(gps_path.glob('*.txt')))
+#     traj = np.zeros((len(twists), 6))
+#     for i, path in enumerate(twists):
+#         # Read first GPS line: Latitude, Longitude, Altitude in degrees
+#         twist = np.genfromtxt(path, delimiter=',',
+#                               dtype=np.float32, max_rows=1)
+#         xyz = twist
+#         traj[i, 3:] = xyz
 
+#     gt_t = torch.Tensor(traj).to(device)  # [n,6]
+#     gt_t = tgm.rtvec_to_pose(gt_t)  # [n,4,4]
+#     # gt_t = rel2abs_traj(gt_t)  # [n,4,4]
+#     return gt_t
+
+
+
+def load_odometry_from_folder(path, timestamp_list):
+    # Let path be "../data/radiate/tiny_foggy/" 
+    # There is "../data/radiate/tiny_foggy/GPS_IMU_Twist/" which contains the GPS/IMU data
+    # There is "../data/radiate/tiny_foggy/GPS_IMU_Twist.txt" which contains:
+    # Frame: 000001 Time: 1574859835.749949000
+    # Frame: 000002 Time: 1574859835.749949000
+    # Frame: 000003 Time: 1574859835.799949000
+    # The timestamp_list contains [157xxxxx, ...]
+    # For each timestamp, find the nearest one in GPS_IMU_Twist.txt and parse the frame
+    # Enumerate all the corresponding frames to get traj
+    
+    gps_path = Path(path) / "GPS_IMU_Twist"
+    twist_file = Path(path) / "GPS_IMU_Twist.txt"
+    
+    # Parse timestamps from the twist file
+    frame_times = []
+    with open(twist_file, 'r') as file:
+        for line in file:
+            parts = line.strip().split()
+            time = float(parts[3])
+            frame_times.append(time)
+    
+    # Normalize the times by subtracting the first value
+    frame_times = np.array(frame_times)
+    frame_times -= frame_times[0]
+    
+    timestamp_list = np.array(timestamp_list)
+    timestamp_list -= timestamp_list[0]
+    
+    # Find nearest frames for each normalized timestamp
+    traj_frames = []
+    for timestamp in timestamp_list:
+        nearest_index = np.argmin(np.abs(frame_times - timestamp))
+        traj_frames.append(nearest_index)
+    
+    # Load the corresponding twist data
+    traj = np.zeros((len(traj_frames), 6))
+    for i, frame_index in enumerate(traj_frames):
+        frame = frame_index + 1  # Assuming frames are 1-indexed
+        twist_path = gps_path / f"{frame:06d}.txt"
+        twist = np.genfromtxt(twist_path, delimiter=',', dtype=np.float32, max_rows=1)
+        traj[i, 3:] = twist
+    
     gt_t = torch.Tensor(traj).to(device)  # [n,6]
     gt_t = tgm.rtvec_to_pose(gt_t)  # [n,4,4]
     # gt_t = rel2abs_traj(gt_t)  # [n,4,4]

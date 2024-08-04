@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 parser = argparse.ArgumentParser(description='Unsupervised Geometry-Aware Ego-motion Estimation for radars and cameras.',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
+# python train.py --data ../data/radiate --with_vo --cam_mode mono --dataset radiate --name dump --radar-format cartesian
 parser.add_argument('data', metavar='DIR', help='path to dataset')
 parser.add_argument('--sequence-length', type=int, metavar='N',
                     help='sequence length for training', default=3)
@@ -551,6 +551,7 @@ def train(
         mask_net, radar_pose_net, disp_net, camera_pose_net, fuse_net, optimizer,
         attention_net, camera_pose_features, radar_pose_features,
         logger, train_writer, warper, mono_warper):
+    # print(depth_scale)
     global n_iter, device
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -869,11 +870,13 @@ def validate(
 
     end = time.time()
     logger.valid_bar.update(0)
+    tgt_timestamps = []
     for i, input in enumerate(val_loader):
         tgt_img = input[0]
         ref_imgs = input[1]
         tgt_img = torch.nan_to_num(tgt_img.to(device))
         ref_imgs = [torch.nan_to_num(img.to(device)) for img in ref_imgs]
+        tgt_timestamps.append(input[-1])
         # intrinsics = intrinsics.to(device)
         # intrinsics_inv = intrinsics_inv.to(device)
 
@@ -1045,10 +1048,11 @@ def validate(
     if args.gt_file is not None:
         # TODO: RADIATE GPS ground-truth causes alignment problems.
         # Don't use GT for RADIATE yet!
-        ro_eval = RadarEvalOdom(args.gt_file, args.dataset)
+        ro_eval = RadarEvalOdom(args.gt_file, args.dataset, tgt_timestamps)
 
         ate_f, f_pred_xyz, f_pred = ro_eval.eval_ref_poses(
             all_poses, all_inv_poses, args.skip_frames)
+        print(ate_f)
 
         if args.with_vo:
             ate_f_mono, f_pred_xyz_mono, f_pred_mono = ro_eval.eval_ref_poses(

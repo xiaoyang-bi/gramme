@@ -165,7 +165,7 @@ class SequenceFolder(data.Dataset):
 
             for cnt, i in enumerate(range(demi_length * self.k, len(imgs)-demi_length * self.k)):
                 # sample = {'intrinsics': intrinsics, 'tgt': imgs[i], 'ref_imgs': []}
-                sample = {'tgt': imgs[i], 'ref_imgs': []}
+                sample = {'tgt': imgs[i], 'ref_imgs': [], 'tgt_timestamp': rts[i]}
                 for j in self.shifts:
                     sample['ref_imgs'].append(imgs[i+j])
 
@@ -183,6 +183,7 @@ class SequenceFolder(data.Dataset):
                         sample['rightTleft'] = rightTleft
                         sample['vo_tgt_img'] = left_imgs[cam_matches[0]]
                         sample['vo_ref_imgs'] = []
+                        
 
                         # sample['vo_tgt_img'] = left_imgs[cam_matches[0]]
                         # sample['vo_ref_imgs'] = []
@@ -385,10 +386,11 @@ class SequenceFolder(data.Dataset):
                 vo_tgt_img = []
                 vo_ref_imgs = []
 
+            tgt_timestamp = sample['tgt_timestamp']
             if self.mode == 'train' and self.cam_mode == 'stereo':
                 return tgt_img, ref_imgs, vo_tgt_img, vo_ref_imgs, intrinsics, extrinsics
             else:
-                return tgt_img, ref_imgs, vo_tgt_img, vo_ref_imgs, intrinsics
+                return tgt_img, ref_imgs, vo_tgt_img, vo_ref_imgs, intrinsics, tgt_timestamp
         else:
             if self.mode == 'test':
                 return tgt_img, ref_imgs, sample['tgt'].stem
