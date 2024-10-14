@@ -6,14 +6,16 @@ from tqdm import tqdm
 import time
 
 import models
-import utils
+# import utils
+from utils.utils import *
 # import custom_transforms_mono as T
 
 import torch
 import torch.backends.cudnn as cudnn
 import torchvision as tv
 import torchvision.transforms as T
-from datasets.sequence_folders_disp import ImageFolder
+# from datasets.sequence_folders_disp import ImageFolder
+from datasets.sequence_folders_clr import SequenceFolder
 import torch.nn.functional as F
 import pandas as pd
 
@@ -25,7 +27,7 @@ parser.add_argument('--dataset', type=str, choices=[
                     'hand', 'robotcar', 'radiate'], default='radiate', help='the dataset to train')
 parser.add_argument('--with-preprocessed', type=int, default=1,
                     help='use the preprocessed undistorted images')
-parser.add_argument('--with-testfile', type=int, default=0,
+parser.add_argument('--with-testfile', type=int, default=1,
                     help='use the test.txt file containing test sequences')
 parser.add_argument("--nsamples", default=2000, type=int,
                     help="Number of samples to subsample from each scene.")
@@ -33,14 +35,20 @@ parser.add_argument('--with-timing', type=int, default=0,
                     help='use the timing benchmark to evaluate the runtime speed')
 parser.add_argument("--pretrained-disp", required=True,
                     type=str, help="pretrained DispNet path")
-parser.add_argument('-j', '--workers', default=4, type=int,
+parser.add_argument('-j', '--workers', default=32, type=int,
                     metavar='N', help='number of data loading workers')
 parser.add_argument('-b', '--batch-size', default=4,
                     type=int, metavar='N', help='mini-batch size')
-parser.add_argument('--seed', default=0, type=int,
+parser.add_argument('--seed', default=3407, type=int,
                     help='seed for random functions, and network initialization')
 parser.add_argument("--img-height", default=192, type=int, help="Image height")
 parser.add_argument("--img-width", default=320, type=int, help="Image width")
+parser.add_argument('--img-norm', action='store_true',
+                    help='weather to perform the norm to img input')
+parser.add_argument('--radar-pov-vertical-aug', action='store_true',
+                    help='weather to perform the vertical aug to radar input')
+parser.add_argument('--radar-channels', default=1, type=int,
+                    help='radar channels num')
 # parser.add_argument("--min-depth", default=1e-3)
 # parser.add_argument("--max-depth", default=80)
 # parser.add_argument("--dataset-dir", default='.', type=str, help="Dataset directory")
@@ -90,76 +98,54 @@ def main():
     cudnn.deterministic = True
     cudnn.benchmark = True
 
-    img_size = (args.img_height, args.img_width)
 
-    if args.dataset == 'robotcar':
-        if args.with_preprocessed:
-            valid_transform = T.Compose([
-                # T.ToPILImage(),
-                T.ToTensor(),
-                # T.Normalize(imagenet_mean, imagenet_std)
-            ])
-        else:
-            valid_transform = T.Compose([
-                T.ToPILImage(),
-                T.CropBottom(),
-                T.Resize(img_size),
-                T.ToTensor(),
-                # T.Normalize(imagenet_mean, imagenet_std)
-            ])
-
-    elif args.dataset == 'radiate':
-        if args.with_preprocessed:
-            valid_transform = T.Compose([
-                T.ToTensor(),
-                # T.Normalize(imagenet_mean, imagenet_std)
-            ])
-        else:
-            valid_transform = T.Compose([
-                # T.ToPILImage(),
-                T.Resize(img_size),
-                T.ToTensor(),
-                # T.Normalize(imagenet_mean, imagenet_std)
-            ])
     if args.with_testfile:
         root = Path(args.data)
         scene_list_path = root/'test_dep.txt'
         scenes = [root/folder.strip()/'stereo_undistorted/left'
-                  for folder in open(scene_list_path) if not folder.strip().startswith("#")]
-        scenes_depth_gt = [root/folder.strip()/'depth_ac'
                   for folder in open(scene_list_path) if not folder.strip().startswith("#")]
         mono_frames_files  = [root/folder.strip()/'zed_left.txt'
                        for folder in open(scene_list_path) if not folder.strip().startswith("#")]
         scene_names = [folder.strip()
                        for folder in open(scene_list_path) if not folder.strip().startswith("#")]
     else:
-        scene_names = 'sequence'
-        scenes = [Path(args.data)]
+        raise NotImplementedError
 
-    # create model
     print("=> creating model")
     disp_net = models.DispResNet(
         args.resnet_layers, False).to(device)
 
-    # load parameters
     print("=> using pre-trained weights for DispResNet")
+
     weights = torch.load(args.pretrained_disp)
     disp_net.load_state_dict(weights['state_dict'], strict=False)
 
-    # switch to evaluate mode
     disp_net.eval()
 
     columns = ["scene_name", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3", "samples"]
     results_df = pd.DataFrame(columns=columns)
     save_interval = 10
-    for scene_name, scene, scene_depth_gt, mono_frames_file in zip(scene_names, scenes, scenes_depth_gt, mono_frames_files):
+    for scene_name, scene, mono_frames_file in zip(scene_names, scenes, mono_frames_files):
         print("=> Processing:", scene_name)
 
         results_depth_dir = results_dir/scene_name/'depth'
         results_depth_dir.mkdir(parents=True, exist_ok=True)
 
-        test_set = ImageFolder(
-            path=scene, depth_gt_path=scene_depth_gt, mono_frames_file = mono_frames_file, transform=valid_transform, nsamples=args.nsamples)
+    
+        print("img norm : {}".format(args.img_norm))
+        test_set = SequenceFolder(
+            args.data,
+            dataset='radiate', 
+            seed=3407, mode='test',
+            sequence=scene_name,
+            img_aug=False,
+            img_norm=args.img_norm,
+            radar_pov_vertical_aug=args.radar_pov_vertical_aug,
+            radar_slices=args.radar_channels > 1,
+            depth_gt_dir='depth_ac'
+        )
+        # ImageFolder(
+        #     path=scene, depth_gt_path=scene_depth_gt, mono_frames_file = mono_frames_file, transform=valid_transform, nsamples=args.nsamples)
         nframes = len(test_set)
         print('{} samples found in {} '.format(
             nframes, scene_name))
@@ -172,16 +158,23 @@ def main():
         avg_time = 0
         errors = []
         ratios = []
-        for i, (tgt_img, tgt_depth_gt, f_names) in tqdm(enumerate(test_loader)):
-            tgt_img = tgt_img.to(device)
-            tgt_depth_gt = tgt_depth_gt.to(device)
-
+        for i, inputs in tqdm(enumerate(test_loader)):
+            # tgt_img = tgt_img.to(device)
+            # tgt_depth_gt = tgt_depth_gt.to(device)
+            inputs = {key: (value.to("cuda") if not isinstance(value, list) else value) for key, value in inputs.items()}
             if args.with_timing:
                 # compute speed
                 torch.cuda.synchronize()
                 t_start = time.time()
 
+
+            tgt_depth_gt = inputs['tgt_depth_gt']
+            tgt_img = inputs['cam_tgt_img']
+    
+
             tgt_depth = [disp_to_depth(disp) for disp in disp_net(tgt_img)]
+        
+            # tgt_depth = [disp_to_depth(disp) for disp in disp_net(tgt_img)]
 
             if args.with_timing:
                 torch.cuda.synchronize()
@@ -193,15 +186,42 @@ def main():
             # 1. mask the gt
             # 2. scale_factor and median_scaling
             # 3. clamp the pred by min and max depth
-            # TODO 每隔10个sample save 一次
-            # TODO 保存ratio, 所有结果为csv格式
-            for j, (depth, depth_gt, f_name) in enumerate(zip(tgt_depth[0], tgt_depth_gt, f_names)):
+            for j, (img, depth, depth_gt) in enumerate(zip(inputs['cam_tgt_img'], tgt_depth[0], tgt_depth_gt)):
                 if (i * args.batch_size + j) % save_interval == 0:
-                    colour_depth = utils.tensor2array(depth, max_value=None, colormap='inferno')
+                    out_file_path = results_depth_dir / f'{i * args.batch_size + j:06d}.png'
+                    
+                    # Convert the depth prediction to a color image
+                    colour_depth = tensor2array(depth, max_value=None, colormap='inferno')
+                    colour_depth = colour_depth[:3, :, :]
                     colour_depth = colour_depth.transpose(1, 2, 0) * 255
                     colour_depth = colour_depth.astype(np.uint8)
-                    im = Image.fromarray(colour_depth)
-                    im.save(results_depth_dir / f'{i * args.batch_size + j:06d}.png')
+                    depth_img = Image.fromarray(colour_depth)
+
+                    # Resize and normalize the ground truth depth for visualization
+                    depth_gt_resized = F.interpolate(depth_gt.unsqueeze(0), (depth.size(-2), depth.size(-1)), mode='nearest').squeeze()
+                    colour_depth_gt = tensor2array(depth_gt_resized, max_value=None, colormap='inferno')
+                    colour_depth_gt = colour_depth_gt[:3, :, :]
+                    colour_depth_gt = colour_depth_gt.transpose(1, 2, 0) * 255
+                    colour_depth_gt = colour_depth_gt.astype(np.uint8)
+
+                    # Convert the original image to uint8 and create an Image object
+                    img_uint8 = img.mul(255).byte().cpu().numpy().transpose(1, 2, 0)
+                    img_pil = Image.fromarray(img_uint8)
+
+                    # Overlay the ground truth depth on the camera image
+                    img_overlay = np.copy(img_uint8)
+                    # non_zero_mask = np.any(depth_gt_resized.squeeze().cpu().numpy() > 0, axis=0)
+                    # img_overlay[non_zero_mask] = colour_depth_gt[non_zero_mask]
+                    img_overlay[np.nonzero(depth_gt_resized.cpu().numpy())]  =  colour_depth_gt[np.nonzero(depth_gt_resized.cpu().numpy())]
+                    overlay_img = Image.fromarray(img_overlay.astype(np.uint8))
+
+                    # Concatenate the overlay with the predicted depth for comparison
+                    combined_img = Image.new('RGB', (img_pil.width * 2, img_pil.height))
+                    combined_img.paste(overlay_img, (0, 0))
+                    combined_img.paste(depth_img, (img_pil.width, 0))
+
+                    # Save the combined image
+                    combined_img.save(out_file_path)
                 
                 
                 depth = F.interpolate(depth.unsqueeze(0), (depth_gt.size(-2), depth_gt.size(-1)), mode='nearest').squeeze(0)
@@ -246,22 +266,15 @@ def main():
             print('Avg Speed: ', 1.0 / avg_time, ' fps')
 
     results_df.to_csv('{}_results.csv'.format(args.pretrained_disp), index=False)
-# def disp_to_depth(disp):
-#     """Convert network's sigmoid output into depth prediction
-#     The formula for this conversion is given in the 'additional considerations'
-#     section of the paper.
-#     """
-#     # Disp is not scaled in DispResNet.
-#     min_depth = 0.1
-#     max_depth = 100.0
-#     min_disp = 1 / max_depth
-#     max_disp = 1 / min_depth
-#     # disp = disp.clamp(min=1e-6)
-#     scaled_disp = min_disp + (max_disp - min_disp) * disp
-#     depth = 1 / scaled_disp
-#     # depth = 1./disp
-#     return depth
 
+
+def save_depth(depth:torch.Tensor, path:str):
+    colour_depth = tensor2array(depth, max_value=None, colormap='inferno')
+    colour_depth = colour_depth.transpose(1, 2, 0) * 255
+    colour_depth = colour_depth.astype(np.uint8)
+    im = Image.fromarray(colour_depth)
+    im.save(path)
+    return
 
 def disp_to_depth(disp):
     # depth_scale = 10.0

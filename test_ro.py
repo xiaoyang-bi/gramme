@@ -175,14 +175,15 @@ def main():
 
     for sequence in sequences:
         results_dir = Path(args.results_dir)/sequence
-        results_dir.mkdir(parents=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         print("=> fetching scenes in '{}'".format(Path(args.data)/sequence))
         val_set = SequenceFolder(
             args.data,
             transform=radar_transform,
             seed=args.seed,
-            train=False,
+            # train=False,
+            mode = 'val',
             sequence_length=args.sequence_length,
             skip_frames=args.skip_frames,
             dataset=args.dataset,

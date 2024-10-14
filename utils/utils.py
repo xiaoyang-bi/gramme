@@ -252,3 +252,64 @@ def save_checkpoint_list(save_path, state_dicts, file_prefixes, epoch='', filena
     """
     for (prefix, state) in zip(file_prefixes, state_dicts):
         torch.save(state, save_path/'{}_{}{}'.format(prefix, epoch, filename))
+
+
+
+# def euler_to_rotation_matrix(euler_angles):
+#     thetaX = np.deg2rad(euler_angles[0])
+#     thetaY = np.deg2rad(euler_angles[1])
+#     thetaZ = np.deg2rad(euler_angles[2])
+
+#     Rx = np.array([[1, 0, 0],
+#                    [0, np.cos(thetaX), -np.sin(thetaX)],
+#                    [0, np.sin(thetaX), np.cos(thetaX)]]).astype(np.float32)
+
+#     Ry = np.array([[np.cos(thetaY), 0, np.sin(thetaY)],
+#                    [0, 1, 0],
+#                    [-np.sin(thetaY), 0, np.cos(thetaY)]]).astype(np.float32)
+
+#     Rz = np.array([[np.cos(thetaZ), -np.sin(thetaZ), 0],
+#                    [np.sin(thetaZ), np.cos(thetaZ), 0],
+#                    [0, 0, 1]]).astype(np.float32)
+
+#     # Combine the rotation matrices
+#     R = np.matmul(Rx, np.matmul(Ry, Rz))
+    
+#     return R
+
+
+def RX(LidarToCamR):
+    thetaX = np.deg2rad(LidarToCamR[0])
+    Rx = np.array([[1, 0, 0],
+                    [0, np.cos(thetaX), -np.sin(thetaX)],
+                    [0, np.sin(thetaX), np.cos(thetaX)]]).astype(np.float32)
+    return Rx
+
+def RY(LidarToCamR):
+    thetaY = np.deg2rad(LidarToCamR[1])
+    Ry = np.array([[np.cos(thetaY), 0, np.sin(thetaY)],
+                    [0, 1, 0],
+                    [-np.sin(thetaY), 0, np.cos(thetaY)]])
+    return Ry
+
+def RZ(LidarToCamR):
+    thetaZ = np.deg2rad(LidarToCamR[2])
+    Rz = np.array([[np.cos(thetaZ), -np.sin(thetaZ), 0],
+                    [np.sin(thetaZ), np.cos(thetaZ), 0],
+                    [0, 0, 1]]).astype(np.float32)
+    return Rz
+
+def euler_to_rotation_matrix(LidarToCamR):
+    Rx = RX(LidarToCamR)
+    Ry = RY(LidarToCamR)
+    Rz = RZ(LidarToCamR)
+
+    R = np.array([[0, 0, -1],
+                    [1, 0, 0],
+                    [0, 1, 0]]).astype(np.float32)
+    R = np.matmul(R, np.matmul(Rx, np.matmul(Ry, Rz)))
+
+    LidarToCam = np.array([[R[0, 0], R[0, 1], R[0, 2]],
+                            [R[1, 0], R[1, 1], R[1, 2]],
+                            [R[2, 0], R[2, 1], R[2, 2]]]).astype(np.float32)
+    return LidarToCam
