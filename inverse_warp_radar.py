@@ -298,22 +298,41 @@ def compute_smooth_loss(tgt_depth, tgt_img, ref_depths, ref_imgs):
 # compute mean value given a binary mask
 
 
+# def mean_on_mask(diff, valid_mask):
+#     mask = valid_mask.expand_as(diff)
+#     thr_mask = diff.numel()//3  # at least a third of the input must be valid
+#     # thr_mask = 6e4*diff.shape[0]
+#     if mask.sum() > thr_mask:
+#         mask_diff = diff * mask
+#         l1 = mask_diff.sum() / (mask.sum()+1e-6)
+#         # l2 = mask_diff.square().sum() / mask.sum()
+#     else:
+#         # l1 = torch.tensor(1e3).float().to(device)
+#         # l2 = torch.tensor(0).float().to(device)
+#         mask_diff = diff
+#         l1 = mask_diff.sum() / (mask.sum()+1e-6)
+
+#     l = l1  # +l2
+#     return l
+
+
 def mean_on_mask(diff, valid_mask):
     mask = valid_mask.expand_as(diff)
-    thr_mask = diff.numel()//3  # at least a third of the input must be valid
-    # thr_mask = 6e4*diff.shape[0]
-    if mask.sum() > thr_mask:
-        mask_diff = diff * mask
-        l1 = mask_diff.sum() / (mask.sum()+1e-6)
-        # l2 = mask_diff.square().sum() / mask.sum()
-    else:
-        # l1 = torch.tensor(1e3).float().to(device)
-        # l2 = torch.tensor(0).float().to(device)
-        mask_diff = diff
-        l1 = mask_diff.sum() / (mask.sum()+1e-6)
+    thr_mask = diff[0].numel() // 3  
 
-    l = l1  # +l2
-    return l
+    mask_sum = mask.view(mask.size(0), -1).sum(dim=1)
+    mean_values = []
+
+    for i in range(diff.size(0)):
+        if mask_sum[i] > thr_mask:
+            mask_diff = diff[i] * mask[i]
+        else:
+            mask_diff = diff[i]
+        l1 = mask_diff.sum() / (mask[i].sum() + 1e-6)
+        mean_values.append(l1)
+
+    overall_mean = torch.stack(mean_values).mean()
+    return overall_mean
 
 
 def fft_frame(img):

@@ -383,7 +383,7 @@ def main():
                 'The chosen MaskNet is not implemented! Given: {}'.format(args.masknet))
 
     radar_pose_net = models.PoseResNet(
-        args.dataset, args.resnet_layers, args.with_pretrain).to(device)
+        args.dataset, args.resnet_layers, False).to(device)
 
     disp_net = camera_pose_net = None
     fuse_net = None
